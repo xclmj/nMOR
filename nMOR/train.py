@@ -16,10 +16,6 @@ from . import model_helper
 from .utils import misc_utils as utils
 from .utils import data_utils
 
-# # DEBUG
-# from tensorflow.python import debug as tf_debug
-
-
 utils.check_tensorflow_version()
 
 __all__ = [
@@ -121,7 +117,7 @@ def before_train(loaded_train_model, train_model, train_sess, global_step,
 
 
 def train(hparams, scope=None, target_session=""):
-  """Train a sequence-to-sequence autoencoder model."""
+  """Train a neural Reduced Order Model."""
 
   log_device_placement = hparams.log_device_placement
   out_dir = hparams.out_dir

@@ -47,7 +47,7 @@ def add_arguments(parser):
   parser.add_argument("--colocate_gradients_with_ops", type="bool", nargs="?",
                       const=True, default=True,
                       help="""\
-                      Wheter try colocating gradients with corresponding op\
+                      Whether try colocating gradients with corresponding op.\
                       """)
 
   # Initializer
@@ -72,6 +72,8 @@ def add_arguments(parser):
                       help="Sample infer data file path.")
   parser.add_argument("--data_size", type=int, nargs="+", default=None,
                       help="Spatial dimension(s) of the data.")
+  partser.add_argument("--prefetch_buffer_size", type=int, default=None,
+                       help="Number of samples to prefetch during ETL.")
 
   # sequence lengths
   parser.add_argument("--src_max_len", type=int, default=50,
@@ -179,6 +181,7 @@ def create_hparams(flags):
       test_data_file=flags.test_data_file,
       sample_infer_data_file=flags.sample_infer_data_file,
       data_size=flags.data_size,
+      prefetch_buffer_size=flags.prefetch_buffer_size,
 
       # Sequence lengths
       src_max_len=flags.src_max_len,
