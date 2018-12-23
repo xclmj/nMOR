@@ -14,11 +14,12 @@ from .utils import misc_utils as utils
 
 utils.check_tensorflow_version()
 
-__all__ = ["BaseModel", "Model1D", "Model2D"]
+__all__ = ["BaseModel", "Autoencoder",
+           "ConvAutoencoder", "ConvRecurrentAutoencoder"]
 
 
 class BaseModel(object):
-  """Convolutional autoencoder nMOR base class."""
+  """Neural Reduced Order Model base class."""
 
   def __init__(self, hparams, iterator, mode, scope=None):
     """Create the model.
@@ -81,7 +82,7 @@ class BaseModel(object):
       self.grad_norm = grad_norm
 
       # Graph update
-      self.update =opt.apply_gradients(
+      self.update = opt.apply_gradients(
           zip(clipped_grads, params),
           global_step=self.global_step)
 
@@ -185,45 +186,6 @@ class BaseModel(object):
     pass
 
 
-  def _conv2d(self, _input, filters, kernel_size, strides, dilation_rate,
-              batch_norm=False, activation=None, name=None):
-    """Wrapper for 2d convolutional layer."""
-    with tf.variable_scope(name) as scope:
-      # Full convolutional layer
-      c1 = tf.layers.conv2d(
-          _input, filters=filters, kernel_size=kernel_size, strides=strides,
-          dilation_rate=dilation_rate, padding="same", activation=activation)
-      if batch_norm:
-        c1 = tf.layers.batch_normalization(c1, training=True)
-    return c1
-
-
-  def _conv3d(self, _input, filters, kernel_size, strides, dilation_rate,
-               batch_norm=False, activation=None, name=None):
-    """Wrapper for 3d convolutional layer."""
-    with tf.variable_scope(name) as scope:
-      # Full 3d convolutional layer
-      c1 = tf.layers.conv3d(
-          _input, filters=filters, kernel_size=kernel_size, strides=strides,
-          dilation_rate=dilation_rate, padding="same", activation=activation)
-      if batch_norm:
-        c1 = tf.layers.batch_normalization(c1, training=True)
-    return c1
-
-
-  def _dconv2d(self, _input, filters, kernel_size, strides,
-               batch_norm=False, activation=None, name=None):
-    """Wrapper for 2D "deconvolution" layer"""
-    with tf.variable_scope(name) as scope:
-      # Upsample convolutional layer
-      c1 = tf.layers.conv2d_transpose(
-          _input, filters=filters, kernel_size=kernel_size,
-          strides=strides , padding="same", activation=activation)
-      if batch_norm:
-        c1 = tf.layers.batch_normalization(c1, training=True)
-    return c1
-
-
   def _build_rnn(self, hparams, enc_state, tgt_states=None):
     """
     Build and run the RNN that evolves the hidden states.
@@ -306,8 +268,7 @@ class BaseModel(object):
 
 
   @abc.abstractmethod
-  def _compute_loss(self, ae_out, ae_enc, rnn_out, rnn_enc,
-                    alpha=0.5, beta=0.5):
+  def _compute_loss(self):
     """Subclass must implement this.
     Computes the unsupervised training loss.
     """
@@ -329,19 +290,151 @@ class BaseModel(object):
     return infer_outputs, infer_summary
 
 
-class Model1D(BaseModel):
-  """Deep convolutional sequence-to-sequence model.
+class Autoencoder(BaseModel):
+  """Deep fully-connected autoencoder model.
 
-  This class implements a deep convolutional sequence-to-sequence model for
-  2D spatio-temporal data (space, time).
+  This class implements a deep autoencoder model for dimensionality reduction
+  of large-scale 1D input data.
   """
 
   def build_graph(self, hparams, scope=None):
-    """Creates a convolutional autoencoder for 2D data with an evolver RNN.
+    """Creates a fully-connected autoencoder for 1D data.
 
     Args:
       hparams: Hyperparameter configurations.
-      scope: VariableScope for the created subgraph; default is "conv_seq2seq".
+      scope: VariableScope for the created subgraph; default is "nMOR".
+
+    Returns:
+      A tuple of the form (loss, outputs)
+      where
+        loss: total loss
+        outputs: float32 Tensor [batch_size, data_size]
+    """
+    utils.print_out("# creating %s graph ..." % self.mode)
+    dtype = tf.float32
+
+    with tf.variable_scope(scope or "nMOR", dtype=dtype):
+
+      # Build fully-connected autoencoder
+      with tf.variable_scope("ae"):
+        ae_enc_state = self._build_encoder(hparams)
+        ae_dec_outputs = self._build_decoder(ae_enc_state, hparams)
+
+      # Training or eval
+      if self.mode != tf.contrib.learn.ModeKeys.INFER:
+        with tf.device(model_helper.get_device_str(1, self.num_gpus)):
+          # Compute ae loss
+          loss = self._compute_loss(ae_dec_outputs)
+      else: # Inferece
+        loss = None
+
+      return loss, ae_dec_outputs, ae_enc_state
+
+
+  def _build_encoder(self, hparams):
+    """Build and run a fully-connected encoder.
+
+    Args:
+      hparams: Hyperparameter configurations.
+
+    Returns:
+      enc_state: float32 Tensor [batch_size, num_units]
+    """
+    source = tf.cast(self.iterator.source, dtype=tf.float32)
+    ae_num_units = hparams.ae_num_units
+    enc_states = []
+
+    with tf.variable_scope("encoder", reuse=reuse) as scope:
+
+      for i, num_units in enumerate(ae_num_units[1:]):
+        layer_input = source if i==0 else enc_states[i-1]
+        # Construct layer
+        layer = tf.layers.dense(
+            layer_input,
+            units=num_units,
+            activation=tf.nn.sigmoid,
+            name=f"enc_dense_{num_units}")
+        # Add dropout wrapper if training
+        if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+          layer = tf.nn.dropout(
+              layer,
+              keep_prob=(1.0-hparams.dropout),
+              seed=hparams.random_seed)
+        # Add layer to enc_states
+        enc_states.append(layer)
+
+    return enc_states[-1]
+
+
+  def _build_decoder(self, enc_state, hparams):
+    """Build and run a fully-connected decoder.
+
+    Args:
+      enc_state: low-dim state to decode to full dim.
+      hparams: Hyperparameter configurations.
+
+    Returns:
+      last element of dec_states, i.e. output
+    """
+    ae_num_units = hparams.ae_num_units
+    dec_states = []
+
+    with tf.variable_scope("decoder", reuse=reuse) as scope:
+
+      for i, num_units in enumerate(ae_num_units[1::-1]):
+        layer_input = enc_state if i==0 else dec_states[i-1]
+        # Construct layer
+        layer = tf.layers.dense(
+            layer_input,
+            units=num_units,
+            activation=tf.nn.sigmoid,
+            name=f"dec_dense_{num_units}")
+        # Add dropout wrapper if training
+        if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+          layer = tf.nn.dropout(
+              layer,
+              keep_prob=(1.0-hparams.dropout),
+              seed=hparams.random_seed)
+        # Add layer to dec_states
+        dec_states.append(layer)
+
+    return dec_states[-1]
+
+
+  def _compute_loss(self, ae_out):
+    """Compute optimization loss of autoencoder
+
+    Args:
+      ae_out: autoencoder output; float64 Tensor [batch_size, data_size]
+
+    Returns:
+      ae_loss: normalized mean squared error
+    """
+    epsilon = 0.0001
+
+    # Autoencoder loss
+    ae_tgt = tf.cast(self.iterator.target_output, dtype=tf.float32)
+    ae_sqr_diff = tf.squared_difference(ae_tgt, ae_out)
+    ae_sqr_l2 = tf.reduce_sum(ae_sqr_diff)
+    ae_norm_factor = tf.reduce_sum(tf.square(ae_tgt))
+    ae_loss = tf.reduce_mean(ae_sqr_l2/(ae_norm_factor+epsilon))
+
+    return ae_loss
+
+
+class ConvAutoencoder(BaseModel):
+  """Deep convolutional autoencoder model.
+
+  This class implements a deep convolutional autoencoder model for
+  large scale 2D data.
+  """
+
+  def build_graph(self, hparams, scope=None):
+    """Creates a convolutional autoencoder for 2D data.
+
+    Args:
+      hparams: Hyperparameter configurations.
+      scope: VariableScope for the created subgraph; default is "nMOR".
 
     Returns:
       A tuple of the form (loss, outputs)
@@ -352,125 +445,106 @@ class Model1D(BaseModel):
     utils.print_out("# creating %s graph ..." % self.mode)
     dtype = tf.float32
 
-    def _reshape_outputs(dec_outputs_flat):
-      dec_outputs = tf.reshape(
-          dec_outputs_flat, (self.batch_size, -1, self.data_size[0]))
-      return dec_outputs
-
     with tf.variable_scope(scope or "nMOR", dtype=dtype):
+
+      # Build convolutional autoencoder
+      with tf.variable_scope("ae"):
+        ae_enc_state = self._build_encoder(hparams)
+        ae_dec_outputs = self._build_decoder(ae_enc_state, hparams)
+
       # Training or eval
       if self.mode != tf.contrib.learn.ModeKeys.INFER:
-        # Build convolutional autoencoder
-        with tf.variable_scope("ae"):
-          ae_enc_states = self._build_encoder(hparams, train_ae=True)
-          ae_dec_outputs_flat = self._build_decoder(ae_enc_states, hparams)
-          ae_dec_outputs = _reshape_outputs(ae_dec_outputs_flat)
-
-        # Build convolutional encoder to feed evolver
-        with tf.variable_scope("ae", reuse=True):
-          rnn_enc_state = self._build_encoder(
-              hparams, train_ae=False, reuse=True)
-
-        # Build evolver RNN
-        with tf.variable_scope("evolver"):
-          rnn_outputs, _ = self._build_rnn(hparams, rnn_enc_state)
-
-        # Reconstruct the full state from evolved rnn states
-        rnn_outputs_flat = tf.reshape(rnn_outputs, (-1, hparams.num_units))
-        with tf.variable_scope("ae", reuse=True):
-          rnn_dec_outputs_flat = self._build_decoder(
-              rnn_outputs_flat, hparams, reuse=True)
-        rnn_dec_outputs = _reshape_outputs(rnn_dec_outputs_flat)
-
         with tf.device(model_helper.get_device_str(1, self.num_gpus)):
-          # Compute ae and evolver loss jointly
-          loss = self._compute_loss(ae_dec_outputs, rnn_dec_outputs)
-
-      # Inferece
-      else:
-        # Build convolutional encoder to feed evolver
-        with tf.variable_scope("ae"):
-          rnn_enc_state = self._build_encoder(hparams, train_ae=False)
-          _ = self._build_decoder(rnn_enc_state, hparams)
-
-        # Build evolver RNN
-        with tf.variable_scope("evolver"):
-          rnn_outputs, _ = self._build_rnn(hparams, rnn_enc_state)
-
-        # Reconstruct the full state from evolved rnn states
-        rnn_outputs_flat = tf.reshape(rnn_outputs, (-1, hparams.num_units))
-        with tf.variable_scope("ae", reuse=True):
-          rnn_dec_outputs_flat = self._build_decoder(rnn_outputs_flat, hparams)
-        rnn_dec_outputs = _reshape_outputs(rnn_dec_outputs_flat)
-
+          # Compute ae loss
+          loss = self._compute_loss(ae_dec_outputs)
+      else: # Inference
         loss = None
 
-      return loss, rnn_dec_outputs
+      return loss, ae_dec_outputs, ae_enc_state
 
 
-  def _build_encoder(self, hparams, train_ae=False, reuse=None):
+  def _build_encoder(self, hparams):
     """Build and run a CNN encoder.
 
     Args:
       hparams: Hyperparameter configurations.
-      train_ae: set to true if training autoencoder, otherwise training evolver
-      resuse: set to true if reusing for rnn.
 
     Returns:
-      enc_state: float32 Tensor [num_samples, num_unts], where num_samples
-        is either batch_size*num_steps if training autoencoder or batch_size
-        if training entire graph
+      enc_state: float32 Tensor [batch_size, num_units]
     """
-    source = self.iterator.source
-    num_samples = self.batch_size
-    if train_ae:
-      source = tf.reshape(self.iterator.target_output, (-1, self.data_size[0]))
-      num_samples, _ = tf.unstack(tf.shape(source))
+    source = tf.expand_dims(self.iterator.source, -1)
+    ae_num_units = hparams.ae_num_units
+    kernel_size = (hparams.kernel_size, hparams.kernel_size)
+    conv_filters = hparams.conv_filters
     source = tf.cast(source, dtype=tf.float32)
+
+    feature_maps = []
+    enc_states = []
 
     with tf.variable_scope("encoder", reuse=reuse) as scope:
 
-      enc_dense_1 = tf.layers.dense(
-          source,
-          units=512,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_1")
+      # Construct convolutional encoder
+      for i, filters in enumerate(conv_filters):
+        layer_input = source if i == 0 else feature_maps[i-1]
+        layer = model_helper.conv2d(
+            layer_input,
+            filters=filters,
+            kernel_size=kernel_size,
+            strides=(2, 2),
+            dilation_rate=(1, 1),
+            batch_norm=False,
+            activation=tf.nn.sigmoid,
+            name=f"enc_conv_{i}")
+        feature_maps.append(layer)
 
-      enc_dense_2 = tf.layers.dense(
-          enc_dense_1,
-          units=256,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_2")
+      # NOTE: hard coded reshape
+      conv_output = tf.reshape(feature_maps[-1], (self.batch_size, 512))
 
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        enc_dense_2 = tf.nn.dropout(
-            enc_dense_2,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
+      # Construct fully-connected encoder
+      for i, num_units in enumerate(ae_num_units[1:]):
+        layer_input = conv_output if i == 0 else enc_states[i-1]
+        layer = tf.layers.dense(
+            layer_input,
+            units=num_units,
+            activation=tf.nn.sigmoid,
+            name=f"enc_dense_{i}")
+        enc_states.append(layer)
 
-      enc_state = tf.layers.dense(
-          enc_dense_2,
-          units=hparams.num_units,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_3")
-
-    return enc_state
+    return enc_states[-1]
 
 
-  def _build_decoder(self, enc_state, hparams, reuse=None):
+  def _build_decoder(self, enc_state, hparams):
     """Build and run an RNN decoder.
 
     Args:
       enc_state: low-dim state to decode to full dim.
       hparams: Hyperparameter configurations.
-      resuse: set to true if reusing for rnn.
 
     Returns:
       outputs: full dim reconstruction
     """
 
+    ae_num_units = hparams.ae_num_units
+    kernel_size = (hparams.kernel_size, hparams.kernel_size)
+    tconv_filters = hparams.tconv_filters
+
+    dec_states = []
+    feature_maps = []
+
     with tf.variable_scope("decoder", reuse=reuse) as scope:
+
+      # Construct fully-connected decoder
+      for i, num_units in enumerate(ae_num_units[1::-1]):
+        layer_input = enc_state if i == 0 else dec_states[i-1]
+        layer = tf.layers.dense(
+            layer_input,
+            units=num_units,
+            activation=tf.nn.sigmoid,
+            name=f"dec_dense_{i}")
+        dec_states.append(layer)
+
+      # NOTE: reshape size is hard-coded
+      tconv_input = tf.reshape(dec_states[-1], (self.batch_size, 4, 4, 32))
 
       dec_dense_1 = tf.layers.dense(
           enc_state,
@@ -478,24 +552,64 @@ class Model1D(BaseModel):
           activation=tf.nn.sigmoid,
           name="dec_dense_1")
 
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        dec_dense_1 = tf.nn.dropout(
-            dec_dense_1,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
-
       dec_dense_2 = tf.layers.dense(
           dec_dense_1,
           units=512,
           activation=tf.nn.sigmoid,
           name="dec_dense_2")
 
-      outputs = tf.layers.dense(
-          dec_dense_2,
-          units=self.data_size[0],
+      # Dropout for better generalization
+      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
+        dec_dense_2 = tf.nn.dropout(
+            dec_dense_2,
+            keep_prob=(1.0-hparams.dropout),
+            seed=hparams.random_seed)
+
+      num_samples, _ = tf.unstack(tf.shape(dec_dense_2))
+      tconv_input = tf.reshape(dec_dense_2, (num_samples, 4, 4, 32))
+
+      # change strides of the first block to control feature map size
+      strides = (4,4) if self.data_size[0] == 128 else (2,2)
+
+      # First "deconvolutional" block
+      tconv1 = model_helper.dconv2d(
+          tconv_input,
+          filters=16,
+          kernel_size=(5,5),
+          strides=strides,
+          batch_norm=True,
           activation=tf.nn.sigmoid,
-          name="dec_dense_3")
+          name="dec_tconv_1")
+
+      tconv2 = model_helper.dconv2d(
+          tconv1,
+          filters=8,
+          kernel_size=(5,5),
+          strides=(2,2),
+          batch_norm=True,
+          activation=tf.nn.sigmoid,
+          name="dec_tconv_2")
+
+      tconv3 = model_helper.dconv2d(
+          tconv2,
+          filters=4,
+          kernel_size=(5,5),
+          strides=(2,2),
+          batch_norm=True,
+          activation=tf.nn.sigmoid,
+          name="dec_tconv_3")
+
+      tconv4 = model_helper.dconv2d(
+          tconv3,
+          filters=1,
+          kernel_size=(5,5),
+          strides=(2,2),
+          batch_norm=True,
+          activation=tf.nn.sigmoid,
+          name="dec_tconv_4")
+
+      outputs = tf.reshape(tconv4,
+                           (num_samples, self.data_size[0], self.data_size[1]))
 
     return outputs
 
@@ -514,7 +628,7 @@ class Model1D(BaseModel):
       loss = alpha*ae_loss + beta*rnn_loss
     """
     epsilon = 0.0001
-    reduce_axis = 2 # Reduce sum over spatial axes
+    reduce_axis = [2,3] # Reduce sum over spatial axes
 
     # Autoencoder loss
     ae_tgt = tf.cast(self.iterator.target_output, dtype=tf.float32)
@@ -624,7 +738,7 @@ class Model2D(BaseModel):
       resuse: set to true if reusing for rnn.
 
     Returns:
-      enc_state: float32 Tensor [num_samples, num_unts], where num_samples
+      enc_state: float32 Tensor [num_samples, num_units], where num_samples
         is either batch_size*num_steps if training autoencoder or batch_size
         if training entire graph
     """
@@ -643,7 +757,7 @@ class Model2D(BaseModel):
       strides = (4,4) if self.data_size[0] == 128 else (2,2)
 
       # First convolutional block
-      sconv1 = self._conv2d(
+      sconv1 = model_helper.conv2d(
           source,
           filters=4,
           kernel_size=kernel_size,
@@ -653,7 +767,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="enc_sconv_1")
 
-      sconv2 = self._conv2d(
+      sconv2 = model_helper.conv2d(
           sconv1,
           filters=8,
           kernel_size=(5, 5),
@@ -663,7 +777,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="enc_sconv_2")
 
-      sconv3 = self._conv2d(
+      sconv3 = model_helper.conv2d(
           sconv2,
           filters=16,
           kernel_size=(5,5),
@@ -673,7 +787,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="enc_sconv_3")
 
-      sconv4 = self._conv2d(
+      sconv4 = model_helper.conv2d(
           sconv3,
           filters=32,
           kernel_size=(5,5),
@@ -747,7 +861,7 @@ class Model2D(BaseModel):
       strides = (4,4) if self.data_size[0] == 128 else (2,2)
 
       # First "deconvolutional" block
-      tconv1 = self._dconv2d(
+      tconv1 = model_helper.dconv2d(
           tconv_input,
           filters=16,
           kernel_size=(5,5),
@@ -756,7 +870,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="dec_tconv_1")
 
-      tconv2 = self._dconv2d(
+      tconv2 = model_helper.dconv2d(
           tconv1,
           filters=8,
           kernel_size=(5,5),
@@ -765,7 +879,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="dec_tconv_2")
 
-      tconv3 = self._dconv2d(
+      tconv3 = model_helper.dconv2d(
           tconv2,
           filters=4,
           kernel_size=(5,5),
@@ -774,7 +888,7 @@ class Model2D(BaseModel):
           activation=tf.nn.sigmoid,
           name="dec_tconv_3")
 
-      tconv4 = self._dconv2d(
+      tconv4 = model_helper.dconv2d(
           tconv3,
           filters=1,
           kernel_size=(5,5),
@@ -821,252 +935,3 @@ class Model2D(BaseModel):
     loss = alpha*ae_loss + beta*rnn_loss
 
     return loss
-
-
-class ParamVarModel(BaseModel):
-  """Deep convolutional recurrent autoencoder for parameter-varying systems.
-
-  This class implements a 3d convolutional neural network for parameter to
-  identify the dynamics of and reduce the input data.
-  """
-
-  def build_graph(self, hparams, scope=None):
-    """Creates a convolutional autoencoder for 2D data with an evolver RNN.
-
-    Args:
-      hparams: Hyperparameter configurations.
-      scope: VariableScope for the created subgraph; default is "conv_seq2seq".
-
-    Returns:
-      A tuple of the form (loss, outputs)
-      where
-        loss: total loss
-        outputs: float32 Tensor [batch_size, num_steps, data_size]
-    """
-    utils.print_out("# creating %s graph ..." % self.mode)
-    dtype = tf.float32
-
-    def _reshape_outputs(dec_outputs_flat):
-      dec_outputs = tf.reshape(
-          dec_outputs_flat,
-          (self.batch_size, -1, self.data_size[0], self.data_size[1]))
-      return dec_outputs
-
-    with tf.variable_scope(scope or "nMOR", dtype=dtype):
-
-      # Build convolutional encoder to feed evolver
-      with tf.variable_scope("ae"):
-        rnn_enc_state = self._build_encoder(hparams)
-
-      # Build evolver RNN
-      with tf.variable_scope("evolver"):
-        rnn_outputs, _ = self._build_rnn(hparams, rnn_enc_state)
-
-      # Reconstruct the full state from evolved rnn states
-      rnn_outputs_flat = tf.reshape(rnn_outputs, (-1, hparams.num_units))
-      with tf.variable_scope("ae", reuse=None):
-        rnn_dec_outputs_flat = self._build_decoder(rnn_outputs_flat, hparams)
-      rnn_dec_outputs = _reshape_outputs(rnn_dec_outputs_flat)
-
-      # Training or eval
-      if self.mode != tf.contrib.learn.ModeKeys.INFER:
-        with tf.device(model_helper.get_device_str(1, self.num_gpus)):
-          # Compute ae and evolver loss jointly
-          loss = self._compute_loss(rnn_dec_outputs)
-      # Inferece
-      else:
-        loss = None
-
-      return loss, rnn_dec_outputs
-
-
-  def _build_encoder(self, hparams, reuse=None):
-    """Build and run a CNN encoder.
-
-    Args:
-      hparams: Hyperparameter configurations.
-      resuse: set to true if reusing for rnn.
-
-    Returns:
-      enc_state: float32 Tensor [num_samples, num_unts], where num_samples
-        is either batch_size*num_steps if training autoencoder or batch_size
-        if training entire graph
-    """
-    source = tf.expand_dims(self.iterator.source, -1)
-    num_samples = self.batch_size
-    source = tf.cast(source, dtype=tf.float32)
-
-    with tf.variable_scope("encoder", reuse=reuse) as scope:
-
-      # first convolutional block for 128 grid size
-      kernel_size = (2,10,10) if self.data_size[0] == 128 else (2,5,5)
-      strides = (1,4,4) if self.data_size[0] == 128 else (1,2,2)
-
-      # First convolutional block
-      sconv1 = self._conv3d(
-          source,
-          filters=4,
-          kernel_size=kernel_size,
-          strides=strides,
-          dilation_rate=(1,1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_1")
-
-      sconv2 = self._conv3d(
-          sconv1,
-          filters=8,
-          kernel_size=(2,5,5),
-          strides=(2,2,2),
-          dilation_rate=(1,1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_2")
-
-      sconv3 = self._conv3d(
-          sconv2,
-          filters=16,
-          kernel_size=(2,5,5),
-          strides=(1,2,2),
-          dilation_rate=(1,1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_3")
-
-      sconv4 = self._conv3d(
-          sconv3,
-          filters=32,
-          kernel_size=(2,5,5),
-          strides=(2,2,2),
-          dilation_rate=(1,1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_4")
-
-      conv_output = tf.reshape(sconv4, (num_samples, 512))
-
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        conv_output = tf.nn.dropout(
-            conv_output,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
-
-      enc_dense_1 = tf.layers.dense(
-          conv_output,
-          units=256,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_1")
-
-      enc_state = tf.layers.dense(
-          enc_dense_1,
-          units=hparams.num_units,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_2")
-
-    return enc_state
-
-
-  def _build_decoder(self, enc_state, hparams, reuse=None):
-    """Build and run an RNN decoder.
-
-    Args:
-      enc_state: low-dim state to decode to full dim.
-      hparams: Hyperparameter configurations.
-      resuse: set to true if reusing for rnn.
-
-    Returns:
-      outputs: full dim reconstruction
-    """
-
-    with tf.variable_scope("decoder", reuse=reuse) as scope:
-
-      dec_dense_1 = tf.layers.dense(
-          enc_state,
-          units=256,
-          activation=tf.nn.sigmoid,
-          name="dec_dense_1")
-
-      dec_dense_2 = tf.layers.dense(
-          dec_dense_1,
-          units=512,
-          activation=tf.nn.sigmoid,
-          name="dec_dense_2")
-
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        dec_dense_2 = tf.nn.dropout(
-            dec_dense_2,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
-
-      num_samples, _ = tf.unstack(tf.shape(dec_dense_2))
-      tconv_input = tf.reshape(dec_dense_2, (num_samples, 4, 4, 32))
-
-      # change strides of the first block to control feature map size
-      strides = (4,4) if self.data_size[0] == 128 else (2,2)
-
-      # First "deconvolutional" block
-      tconv1 = self._dconv2d(
-          tconv_input,
-          filters=16,
-          kernel_size=(5,5),
-          strides=strides,
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_1")
-
-      tconv2 = self._dconv2d(
-          tconv1,
-          filters=8,
-          kernel_size=(5,5),
-          strides=(2,2),
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_2")
-
-      tconv3 = self._dconv2d(
-          tconv2,
-          filters=4,
-          kernel_size=(5,5),
-          strides=(2,2),
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_3")
-
-      tconv4 = self._dconv2d(
-          tconv3,
-          filters=1,
-          kernel_size=(5,5),
-          strides=(2,2),
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_4")
-
-      outputs = tf.reshape(tconv4,
-                           (num_samples, self.data_size[0], self.data_size[1]))
-
-    return outputs
-
-
-  def _compute_loss(self, rnn_out):
-    """Compute optimization loss as weighted sum of autoencoder loss and loss
-    between autoencoder states and predicted rnn states.
-
-    Args:
-      rnn_out: rnn output; float32 Tensor [batch_size, num_steps, Nx, ...]
-
-    Returns:
-      loss = alpha*ae_loss + beta*rnn_loss
-    """
-    epsilon = 0.0001
-    reduce_axis = [2,3] # Reduce sum over spatial axes
-
-    # RNN output loss
-    rnn_tgt = tf.cast(self.iterator.target_output, dtype=tf.float32)
-    rnn_sqr_diff = tf.squared_difference(rnn_tgt, rnn_out)
-    rnn_sqr_l2 = tf.reduce_sum(rnn_sqr_diff, axis=reduce_axis)
-    rnn_norm_factor = tf.reduce_sum(tf.square(rnn_tgt), axis=reduce_axis)
-    rnn_loss = tf.reduce_mean(rnn_sqr_l2/(rnn_norm_factor+epsilon))
-
-    return rnn_loss

@@ -24,7 +24,13 @@ def add_arguments(parser):
 
   # Network
   parser.add_argument("--num_units", type=int, default=32,
-                      help="Number of units to in each layer for the bi-RNN.")
+                      help="Number of units to use in the RNN.")
+  # TODO: ae_num_units and num_units are redundant. Keep ae_num_units only.
+  parser.add_argument("--ae_num_units", type=int, nargs="+", default=None,
+                      help="""\
+                      List of number of units to use in the fully-connected
+                      autoencoder.\
+                      """)
   parser.add_argument("--time_major", type="bool", nargs="?", const=True,
                       help="Whether to use time-major mode.")
 
@@ -160,7 +166,8 @@ def create_hparams(flags):
   """Create training hparams."""
   return tf.contrib.training.HParams(
       # Network
-      num_units=flags.num_units,
+      num_units = flags.num_units,
+      ae_num_units=flags.ae_num_units,
       time_major=flags.time_major,
 
       # Optimizer

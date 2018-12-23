@@ -15,7 +15,8 @@ from .utils import data_utils
 __all__ = [
     "get_initializer", "get_device_str",
     "create_train_model", "create_eval_model", "create_infer_model",
-    "create_rnn_cell", "gradient_clip", "create_or_load_model", "load_model"
+    "conv2d", "dconv2d", "create_rnn_cell", "gradient_clip",
+    "create_or_load_model", "load_model"
 ]
 
 
@@ -167,6 +168,32 @@ def create_infer_model(model_creator, hparams, scope=None):
       model=model,
       iterator=iterator,
       data_placeholder=data_placeholder)
+
+
+def conv2d(self, _input, filters, kernel_size, strides, dilation_rate,
+           batch_norm=False, activation=None, name=None):
+  """Wrapper for 2d convolutional layer."""
+  with tf.variable_scope(name) as scope:
+    # Full convolutional layer
+    c1 = tf.layers.conv2d(
+        _input, filters=filters, kernel_size=kernel_size, strides=strides,
+        dilation_rate=dilation_rate, padding="same", activation=activation)
+    if batch_norm:
+      c1 = tf.layers.batch_normalization(c1, training=True)
+  return c1
+
+
+def dconv2d(self, _input, filters, kernel_size, strides,
+            batch_norm=False, activation=None, name=None):
+  """Wrapper for 2D "deconvolution" layer"""
+  with tf.variable_scope(name) as scope:
+    # Upsample convolutional layer
+    c1 = tf.layers.conv2d_transpose(
+        _input, filters=filters, kernel_size=kernel_size,
+        strides=strides , padding="same", activation=activation)
+    if batch_norm:
+      c1 = tf.layers.batch_normalization(c1, training=True)
+  return c1
 
 
 def create_rnn_cell(unit_type, num_units, forget_bias, dropout, mode,
