@@ -648,12 +648,12 @@ class ConvAutoencoder(BaseModel):
     return loss
 
 
-class Model2D(BaseModel):
-  """Deep convolutional sequence-to-sequence model.
+  class ConvRecurrentAutoencoder(BaseModel):
+    """Deep convolutional recurrent autoencoder.
 
-  This class implements a deep convolutional sequence-to-sequence model for
-  3D spatio-temporal data (space1, space2, time).
-  """
+    This class implements a deep convolutional recurrent autoencoder for large
+    scale 2D data.
+    """
 
   def build_graph(self, hparams, scope=None):
     """Creates a convolutional autoencoder for 2D data with an evolver RNN.
@@ -744,81 +744,50 @@ class Model2D(BaseModel):
     """
     source = tf.expand_dims(self.iterator.source, -1)
     num_samples = self.batch_size
+
     if train_ae:
       source = tf.expand_dims(self.iterator.target_output, -1)
       source = tf.reshape(source, (-1, self.data_size[0], self.data_size[1], 1))
       num_samples, _, _, _ = tf.unstack(tf.shape(source))
     source = tf.cast(source, dtype=tf.float32)
 
+    ae_num_units = hparams.ae_num_units
+    kernel_size = (hparams.kernel_size, hparams.kernel_size)
+    conv_filters = hparams.conv_filters
+
+    feature_maps = []
+    enc_states = []
+
     with tf.variable_scope("encoder", reuse=reuse) as scope:
 
-      # first convolutional block for 128 grid size
-      kernel_size = (10,10) if self.data_size[0] == 128 else (5,5)
-      strides = (4,4) if self.data_size[0] == 128 else (2,2)
+      # Construct convolutional encoder
+      for i, filters in enumerate(conv_filters):
+        layer_input = source if i == 0 else feature_maps[i-1]
+        layer = model_helper.conv2d(
+            layer_input,
+            filters=filters,
+            kernel_size=kernel_size=,
+            strides=(2, 2),
+            dilation_rate=(1, 1),
+            batch_norm=False,
+            activation=tf.nn.sigmoid,
+            name=f"enc_conv_{i}")
+        feature_maps.append(layer)
 
-      # First convolutional block
-      sconv1 = model_helper.conv2d(
-          source,
-          filters=4,
-          kernel_size=kernel_size,
-          strides=strides,
-          dilation_rate=(1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_1")
+      # Note: hard coded reshape
+      conv_output = tf.reshape(feature_maps[-1], (self.batch_size, 512))
 
-      sconv2 = model_helper.conv2d(
-          sconv1,
-          filters=8,
-          kernel_size=(5, 5),
-          strides=(2,2),
-          dilation_rate=(1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_2")
+      # Construct fully-connected encoder
+      for i, num_units in enumerate(ae_num_units[1:]):
+        layer_input = conv_output if i == 0 else enc_states[i-1]
+        layer = tf.layers.dense(
+            layer_input,
+            units=num_units,
+            activation=tf.nn.sigmoid,
+            name=f"enc_dense_{i}")
+        enc_states.append(layer)
 
-      sconv3 = model_helper.conv2d(
-          sconv2,
-          filters=16,
-          kernel_size=(5,5),
-          strides=(2,2),
-          dilation_rate=(1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_3")
-
-      sconv4 = model_helper.conv2d(
-          sconv3,
-          filters=32,
-          kernel_size=(5,5),
-          strides=(2,2),
-          dilation_rate=(1,1),
-          batch_norm=False,
-          activation=tf.nn.sigmoid,
-          name="enc_sconv_4")
-
-      conv_output = tf.reshape(sconv4, (num_samples, 512))
-
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        conv_output = tf.nn.dropout(
-            conv_output,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
-
-      enc_dense_1 = tf.layers.dense(
-          conv_output,
-          units=256,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_1")
-
-      enc_state = tf.layers.dense(
-          enc_dense_1,
-          units=hparams.num_units,
-          activation=tf.nn.sigmoid,
-          name="enc_dense_2")
-
-    return enc_state
+    return enc_states[-1]
 
 
   def _build_decoder(self, enc_state, hparams, reuse=None):
