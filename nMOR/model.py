@@ -186,87 +186,6 @@ class BaseModel(object):
     pass
 
 
-  def _build_rnn(self, hparams, enc_state, tgt_states=None):
-    """
-    Build and run the RNN that evolves the hidden states.
-
-    Args:
-      enc_state: the initial hidden state to evolve.
-      hparams: Hyperparameter configurations.
-
-    Returns:
-      A tuple of the form (rnn_outputs, rnn_final_state) where
-        rnn_outputs: a float32 Tensor [batch_size, num_steps, num_units]
-        rnn_final_state: a float32 Tensor [batch_size, num_steps, num_units]
-    """
-    # Convert enc_state to LSTMStateTuple
-    enc_state = tf.contrib.rnn.LSTMStateTuple(c=enc_state, h=enc_state)
-
-    # # Use tgt_states random teacher forcing
-    # if tgt_states is not None:
-    #   tgt_states = tf.reshape(
-    #       tgt_states, (self.batch_size, -1, hparams.num_units))
-    #   tgt_states = tf.transpose(tgt_states, [1,0,2])
-
-    # Define start and end steps
-    start_step = tf.ones([self.batch_size, hparams.num_units], dtype=tf.float32)
-    end_step = tf.zeros([self.batch_size, hparams.num_units], dtype=tf.float32)
-
-    # Raw rnn looping functions
-    def _loop_fn_initial():
-      initial_elements_finished = (0 >= self.iterator.sequence_length)
-      initial_input = start_step
-      initial_cell_state = enc_state
-      initial_cell_output = None
-      initial_loop_state = None
-      return (initial_elements_finished,
-              initial_input,
-              initial_cell_state,
-              initial_cell_output,
-              initial_loop_state)
-
-    def _loop_fn_transition(time, previous_output, previous_state,
-                            previous_loop_state):
-      def get_next_input():
-        # if tgt_states is not None: # random teacher forcing
-        #   teach = tf.cast(np.random.randint(0,2)<1, tf.bool)
-        #   next_input = tf.cond(
-        #       teach, lambda: tgt_states[time], lambda: previous_output)
-        # else: # no teacher forcing during inference
-        #   next_input = previous_output
-        return previous_output
-      elements_finished = (time >= self.iterator.sequence_length)
-      finished = tf.reduce_all(elements_finished)
-      input_ = tf.cond(finished, lambda: end_step, get_next_input)
-      state = previous_state
-      output = previous_output
-      loop_state = None
-      return (elements_finished, input_, state, output, loop_state)
-
-    def _loop_fn(time, previous_output, previous_state, previous_loop_state):
-      if previous_state is None: # time == 0
-        assert previous_output is None and previous_state is None
-        return _loop_fn_initial()
-      else:
-        return _loop_fn_transition(time, previous_output, previous_state,
-                                   previous_loop_state)
-
-    with tf.variable_scope("rnn") as scope:
-      cell = model_helper.create_rnn_cell(
-          unit_type=hparams.unit_type,
-          num_units=hparams.num_units,
-          forget_bias=hparams.forget_bias,
-          dropout=hparams.dropout,
-          mode=self.mode,
-          # num_proj=hparams.num_units,
-          use_peepholes=True)
-      rnn_outputs_ta, rnn_final_state, _ = tf.nn.raw_rnn(cell, _loop_fn)
-      rnn_outputs = rnn_outputs_ta.stack()
-      # Back to batch-major
-      rnn_outputs = tf.transpose(rnn_outputs, [1,0,2])
-    return rnn_outputs, rnn_final_state
-
-
   @abc.abstractmethod
   def _compute_loss(self):
     """Subclass must implement this.
@@ -766,7 +685,7 @@ class ConvAutoencoder(BaseModel):
         layer = model_helper.conv2d(
             layer_input,
             filters=filters,
-            kernel_size=kernel_size=,
+            kernel_size=kernel_size,
             strides=(2, 2),
             dilation_rate=(1, 1),
             batch_norm=False,
@@ -801,75 +720,125 @@ class ConvAutoencoder(BaseModel):
     Returns:
       outputs: full dim reconstruction
     """
+    ae_num_units = hparams.ae_num_units
+    kernel_size = (hparams.kernel_size, hparams.kernel_size)
+    tconv_filters = hparams.tconv_filters
+    dec_states = []
+    feature_maps = []
 
     with tf.variable_scope("decoder", reuse=reuse) as scope:
 
-      dec_dense_1 = tf.layers.dense(
-          enc_state,
-          units=256,
+      # NOTE: test with ae_num_units (256, 512) and no dropout wrapper
+      for i, num_units in enumerate(ae_num_units[1::-1]):
+        layer_input = enc_state if i==0 else dec_states[i-1]
+        layer = tf.layers.dense(
+          layer_input,
+          units=num_units,
           activation=tf.nn.sigmoid,
-          name="dec_dense_1")
+          name=f"dec_dense_{i}")
+        dec_states.append(layer)
 
-      dec_dense_2 = tf.layers.dense(
-          dec_dense_1,
-          units=512,
-          activation=tf.nn.sigmoid,
-          name="dec_dense_2")
+      # Get number of samples (may be batch_size * sequence_length)
+      num_samples, _ = tf.unstack(tf.shape(dec_states[-1]))
+      tconv_input = tf.reshape(dec_states[-1], (num_samples, 4, 4, 32))
 
-      # Dropout for better generalization
-      if self.mode == tf.contrib.learn.ModeKeys.TRAIN:
-        dec_dense_2 = tf.nn.dropout(
-            dec_dense_2,
-            keep_prob=(1.0-hparams.dropout),
-            seed=hparams.random_seed)
-
-      num_samples, _ = tf.unstack(tf.shape(dec_dense_2))
-      tconv_input = tf.reshape(dec_dense_2, (num_samples, 4, 4, 32))
-
-      # change strides of the first block to control feature map size
-      strides = (4,4) if self.data_size[0] == 128 else (2,2)
-
-      # First "deconvolutional" block
-      tconv1 = model_helper.dconv2d(
-          tconv_input,
-          filters=16,
-          kernel_size=(5,5),
-          strides=strides,
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_1")
-
-      tconv2 = model_helper.dconv2d(
-          tconv1,
-          filters=8,
-          kernel_size=(5,5),
+      for i, filters in enumerate(tconv_filters):
+        layer_input = tconv_input if i==0 else feature_maps[i-1]
+        layer = model_helper.dconv2d(
+          layer_input,
+          filters=filters,
+          kernel_size=(kernel_size, kernel_size)
           strides=(2,2),
           batch_norm=True,
           activation=tf.nn.sigmoid,
-          name="dec_tconv_2")
+          name=f"dec_conv_{i}")
 
-      tconv3 = model_helper.dconv2d(
-          tconv2,
-          filters=4,
-          kernel_size=(5,5),
-          strides=(2,2),
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_3")
-
-      tconv4 = model_helper.dconv2d(
-          tconv3,
-          filters=1,
-          kernel_size=(5,5),
-          strides=(2,2),
-          batch_norm=True,
-          activation=tf.nn.sigmoid,
-          name="dec_tconv_4")
-
-      outputs = tf.reshape(tconv4,
+      # NOTE: reshape size is hard-coded
+      outputs = tf.reshape(feature_maps[-1],
                            (num_samples, self.data_size[0], self.data_size[1]))
 
     return outputs
+
+
+  def _build_rnn(self, hparams, enc_state, tgt_states=None):
+    """
+    Build and run the RNN that evolves the hidden states.
+
+    Args:
+      enc_state: the initial hidden state to evolve.
+      hparams: Hyperparameter configurations.
+
+    Returns:
+      A tuple of the form (rnn_outputs, rnn_final_state) where
+        rnn_outputs: a float32 Tensor [batch_size, num_steps, num_units]
+        rnn_final_state: a float32 Tensor [batch_size, num_steps, num_units]
+    """
+    # Convert enc_state to LSTMStateTuple
+    enc_state = tf.contrib.rnn.LSTMStateTuple(c=enc_state, h=enc_state)
+
+    # # Use tgt_states random teacher forcing
+    # if tgt_states is not None:
+    #   tgt_states = tf.reshape(
+    #       tgt_states, (self.batch_size, -1, hparams.num_units))
+    #   tgt_states = tf.transpose(tgt_states, [1,0,2])
+
+    # Define start and end steps
+    start_step = tf.ones([self.batch_size, hparams.num_units], dtype=tf.float32)
+    end_step = tf.zeros([self.batch_size, hparams.num_units], dtype=tf.float32)
+
+    # Raw rnn looping functions
+    def _loop_fn_initial():
+      initial_elements_finished = (0 >= self.iterator.sequence_length)
+      initial_input = start_step
+      initial_cell_state = enc_state
+      initial_cell_output = None
+      initial_loop_state = None
+      return (initial_elements_finished,
+              initial_input,
+              initial_cell_state,
+              initial_cell_output,
+              initial_loop_state)
+
+    def _loop_fn_transition(time, previous_output, previous_state,
+                            previous_loop_state):
+      def get_next_input():
+        # if tgt_states is not None: # random teacher forcing
+        #   teach = tf.cast(np.random.randint(0,2)<1, tf.bool)
+        #   next_input = tf.cond(
+        #       teach, lambda: tgt_states[time], lambda: previous_output)
+        # else: # no teacher forcing during inference
+        #   next_input = previous_output
+        return previous_output
+      elements_finished = (time >= self.iterator.sequence_length)
+      finished = tf.reduce_all(elements_finished)
+      input_ = tf.cond(finished, lambda: end_step, get_next_input)
+      state = previous_state
+      output = previous_output
+      loop_state = None
+      return (elements_finished, input_, state, output, loop_state)
+
+    def _loop_fn(time, previous_output, previous_state, previous_loop_state):
+      if previous_state is None: # time == 0
+        assert previous_output is None and previous_state is None
+        return _loop_fn_initial()
+      else:
+        return _loop_fn_transition(time, previous_output, previous_state,
+                                   previous_loop_state)
+
+    with tf.variable_scope("rnn") as scope:
+      cell = model_helper.create_rnn_cell(
+          unit_type=hparams.unit_type,
+          num_units=hparams.num_units,
+          forget_bias=hparams.forget_bias,
+          dropout=hparams.dropout,
+          mode=self.mode,
+          # num_proj=hparams.num_units,
+          use_peepholes=True)
+      rnn_outputs_ta, rnn_final_state, _ = tf.nn.raw_rnn(cell, _loop_fn)
+      rnn_outputs = rnn_outputs_ta.stack()
+      # Back to batch-major
+      rnn_outputs = tf.transpose(rnn_outputs, [1,0,2])
+    return rnn_outputs, rnn_final_state
 
 
   def _compute_loss(self, ae_out, rnn_out, alpha=0.5, beta=0.5):
